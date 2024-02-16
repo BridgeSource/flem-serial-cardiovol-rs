@@ -1,7 +1,5 @@
 use flem::{
-    Status,
-    traits::Channel, 
-    Packet,
+    traits::{Channel, DataInterface}, Packet, Status
 };
 use serialport::SerialPort;
 use std::{
@@ -14,11 +12,7 @@ use std::{
     time::Duration,
 };
 
-use bsm_rs::flem::cardiovol;
-use bsm_rs::flem::cardiovol::structs::{
-    AdmittanceEventResult, AdmittanceEvent
-};
-use bsm_rs::flem::cardiovol::client_requests::ADMITTANCE;
+use bsm_rs::flem::cardiovol::structs::{CardioVolDataStream, CardioVolPacket};
 
 type FlemSerialPort = Box<dyn SerialPort>;
 type FlemSerialTx = Option<Arc<Mutex<FlemSerialPort>>>;
@@ -258,10 +252,9 @@ impl<const PACKET_SIZE: usize> Channel<PACKET_SIZE> for FlemSerial<PACKET_SIZE> 
 
             let mut rx_buffer = [0 as u8; 2048];
             let mut rx_packet = flem::Packet::<PACKET_SIZE>::new();
-
-            let mut counter = 0;
-            let mut packets = 0;
-            let mut payload = [0_u8; AdmittanceEvent::MAX_RESULTS_PER_PACKET*AdmittanceEventResult::SIZE_BYTES];
+            let mut tx_packet = flem::Packet::<PACKET_SIZE>::new();
+            let mut cardiovol_packet = CardioVolPacket::new();
+            let mut cardiovol_stream = CardioVolDataStream::new();
 
             while *continue_listening_clone_rx.lock().unwrap() {
                 match local_rx_port.read(&mut rx_buffer) {
@@ -272,83 +265,41 @@ impl<const PACKET_SIZE: usize> Channel<PACKET_SIZE> for FlemSerial<PACKET_SIZE> 
                             thread::sleep(Duration::from_millis(10));
                         } else {
                             let mut i: usize = 0;
-                            'search: while i < bytes_to_read-5 {
-                                if AdmittanceEventResult::be_to_u16(&rx_buffer[i..i+2]) == cardiovol::PACKET_START {
-                                    // Advance past the header bytes
-                                    i += 2;
-                                    // Read 2-byte size
-                                    let length: usize = usize::from(AdmittanceEventResult::le_to_u16(&rx_buffer[i..i+2]));
-
-                                    // Advance past the length bytes
-                                    i += 2;
-
-
-                                    if i+length > bytes_to_read {
-                                        //Incomplete packet
-                                        println!("Incomplete packet, skipping...");
-                                        break 'search;
-                                    } else if i+length < (bytes_to_read) {
-                                        if AdmittanceEventResult::be_to_u16(&rx_buffer[i+length..i+length+2]) != cardiovol::PACKET_START {
-                                            // Malformed packet
-                                            println!("Malformed packet, skipping...");
-                                            break 'search;
+                            while i < bytes_to_read {
+                                match cardiovol_stream.construct(rx_buffer[i]) {
+                                    Ok(_) => {
+                                        if cardiovol_packet.add(&cardiovol_stream.data) {
+                                            // Packet full, send it
+                                            cardiovol_packet.encode(&mut tx_packet).unwrap();
+                                            tx_packet.set_response(flem::response::ASYNC);
+                                            tx_packet.set_request(bsm_rs::flem::cardiovol::client_requests::ADMITTANCE);
+                                            tx_packet.pack();
+                                            validated_packet.send(tx_packet).unwrap();
+                                            tx_packet.reset_lazy();
+                                            // validated_packet.send(cardiovol_packet.clone()).unwrap()
                                         }
+                                        cardiovol_stream.reset_lazy();
                                     }
-
-                                    // Add data to payload
-                                    let data = &rx_buffer[i..i+length];
-                                    payload[AdmittanceEventResult::SIZE_BYTES*packets..AdmittanceEventResult::SIZE_BYTES*packets+data.len()].copy_from_slice(data);
-
-                                    // UNIMPLEMENTED: Add time stamp at end of data bytes
-
-                                    // Advance past data bytes
-                                    i += usize::from(length);
-                                    packets += 1;
-                                    if packets == AdmittanceEvent::MAX_RESULTS_PER_PACKET {
-                                        // We have enough packets, pack it up and send
-                                        match rx_packet.pack_data(ADMITTANCE, &payload) {
-                                            Ok(_) => {
-                                                validated_packet.send(rx_packet.clone()).unwrap();
+                                    Err(error) => {
+                                        match error {
+                                            Status::PacketBuilding => {
+                                                // Normal, building packet DO NOT RESET!
+                                            }
+                                            Status::HeaderBytesNotFound => {
+                                                // Not unusual, keep scanning until packet lock occurs
+                                            }
+                                            Status::ChecksumError => {
+                                                println!("FLEM checksum error detected");
                                                 rx_packet.reset_lazy();
                                             }
-                                            Err(error) => {
-                                                println!("Error: {:?}", error);
+                                            _ => {
+                                                println!("FLEM error detected: {:?}", error);
+                                                rx_packet.reset_lazy();
                                             }
                                         }
-                                        // Reset packet counter and payload
-                                        packets = 0;
-                                        payload = [0_u8; AdmittanceEvent::MAX_RESULTS_PER_PACKET*AdmittanceEventResult::SIZE_BYTES];
                                     }
-
-                                    counter += 1;
-                                } else {
-                                    i += 1;
                                 }
-
-                                // match rx_packet.construct(rx_buffer[i]) {
-                                //     Ok(_) => {
-                                //         validated_packet.send(rx_packet.clone()).unwrap();
-                                //         rx_packet.reset_lazy();
-                                //     }
-                                //     Err(error) => {
-                                //         match error {
-                                            // Status::PacketBuilding => {
-                                //                 // Normal, building packet DO NOT RESET!
-                                //             }
-                                //             Status::HeaderBytesNotFound => {
-                                //                 // Not unusual, keep scanning until packet lock occurs
-                                //             }
-                                //             Status::ChecksumError => {
-                                //                 println!("FLEM checksum error detected");
-                                //                 rx_packet.reset_lazy();
-                                //             }
-                                //             _ => {
-                                //                 println!("FLEM error detected: {:?}", error);
-                                //                 rx_packet.reset_lazy();
-                                //             }
-                                //         }
-                                //     }
-                                // }
+                                i += 1;
                             }
                         }
                     }
