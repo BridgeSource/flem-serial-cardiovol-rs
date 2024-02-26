@@ -1,5 +1,5 @@
 [package]
-name = "flem-serial-rs"
+name = "flem-serial-cardiovol-rs"
 version = "0.3.2"
 edition = "2021"
 authors = ["Austin McElroy <mcelroy.austin@gmail.com>"]
